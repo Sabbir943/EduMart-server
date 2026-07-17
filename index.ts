@@ -54,7 +54,113 @@ async function run() {
         });
       }
     });
+   // --- API Endpoint: Get Top 3 Most Enrolled/Popular Courses (GET) ---
+    app.get("/api/courses/popular", async (req, res) => {
+      try {
+        // মঙ্গোডিবি এগ্রিগেশন পাইপলাইন দিয়ে পপুলার কোর্স গণনা
+        const popularCourses = await database.collection("enrollments").aggregate([
+          {
+            // ১. কোর্স আইডি অনুযায়ী গ্রুপ করা এবং মোট সেলস/এনরোলমেন্ট গণনা করা
+            $group: {
+              _id: "$courseId",
+              enrollmentCount: { $sum: 1 }
+            }
+          },
+          {
+            // ২. সবচেয়ে বেশি এনরোলমেন্ট হওয়া কোর্সগুলোকে উপরে রাখা (Descending Order)
+            $sort: { enrollmentCount: -1 }
+          },
+          {
+            // ৩. শুধুমাত্র সেরা ৩টি কোর্সের আইডি নেওয়া
+            $limit: 3
+          },
+          {
+            // ৪. মেইন 'courses' কালেকশনের সাথে আইডি ম্যাচ করে ফুল ডাটা নিয়ে আসা (Join)
+            $lookup: {
+              from: "courses",
+              let: { courseIdObj: { $toObjectId: "$_id" } },
+              pipeline: [
+                { $match: { $expr: { $eq: ["$_id", "$$courseIdObj"] } } }
+              ],
+              as: "courseDetails"
+            }
+          },
+          {
+            // ৫. অ্যারে ফরম্যাট থেকে অবজেক্টে কনভার্ট করা
+            $unwind: "$courseDetails"
+          },
+          {
+            // ৬. রেসপন্স ফরম্যাট সুন্দর করা
+            $project: {
+              _id: "$courseDetails._id",
+              name: "$courseDetails.name",
+              category: "$courseDetails.category",
+              price: "$courseDetails.price",
+              duration: "$courseDetails.duration",
+              image: "$courseDetails.image",
+              enrollmentCount: 1
+            }
+          }
+        ]).toArray();
 
+        res.json({ success: true, courses: popularCourses });
+      } catch (error) {
+        res.status(500).json({ 
+          success: false, 
+          message: "Failed to compile popular workforce matrix.", 
+          error: (error as any).message 
+        });
+      }
+    });
+
+    app.get("/api/mentors/top-contributor", async (req, res) => {
+      try {
+        // ১. আপনার স্কিমা অনুযায়ী mentorEmail, instructorEmail অথবা email তিনটাই ব্যাকআপ হিসেবে চেক করা
+        const topMentorGroup = await database.collection("courses").aggregate([
+          {
+            $group: {
+              _id: { 
+                $ifNull: ["$mentorEmail", { $ifNull: ["$instructorEmail", "$email"] }] 
+              },
+              totalCourses: { $sum: 1 }
+            }
+          },
+          { $sort: { totalCourses: -1 } },
+          { $limit: 1 }
+        ]).toArray();
+
+        if (topMentorGroup.length === 0 || !topMentorGroup[0]?. _id) {
+          return res.status(404).json({ success: false, message: "No mentor emails found in courses collection." });
+        }
+
+     const targetEmail = topMentorGroup[0]!._id;
+        const totalCoursesCount = topMentorGroup[0]!.totalCourses;
+
+        // ২. Better-Auth এর 'users' অথবা 'user' কালেকশন থেকে মেন্টরের নাম ও ছবি খোঁজা
+        let mentorInfo = await database.collection("users").findOne({ email: targetEmail });
+        
+        if (!mentorInfo) {
+          // ব্যাকআপ হিসেবে 'user' কালেকশন চেক করা
+          mentorInfo = await database.collection("user").findOne({ email: targetEmail });
+        }
+
+        // যদি মেন্টরকে Better-Auth এও খুঁজে না পাওয়া যায়, তবে একটি ফলব্যাক অবজেক্ট তৈরি করা
+        const responseData = {
+          email: targetEmail,
+          name: mentorInfo?.name || targetEmail.split("@")[0], // ইমেইলের প্রথম অংশ নাম হিসেবে
+          image: mentorInfo?.image || "",
+          totalCourses: totalCoursesCount
+        };
+
+        res.json({ success: true, mentor: responseData });
+      } catch (error) {
+        res.status(500).json({ 
+          success: false, 
+          message: "Internal server error during contributor compilation.", 
+          error: (error as any).message 
+        });
+      }
+    });
     // --- API Endpoint: Get Courses with Pagination, Search, Filtering & Sorting (GET) ---
     app.get("/api/courses", async (req, res) => {
       try {
@@ -160,6 +266,71 @@ async function run() {
         res.json({ success: true, courses });
       } catch (error) {
         res.status(500).json({ success: false, message: "Server failed to resolve courses matrix.", error: (error as any).message });
+      }
+    });
+
+    // --- API Endpoint: Cancel/Delete a Student Enrollment (DELETE) ---
+app.delete("/api/student/enrollments/:enrollmentId", async (req, res) => {
+  try {
+    const { enrollmentId } = req.params;
+
+    if (!ObjectId.isValid(enrollmentId)) {
+      return res.status(400).json({ success: false, message: "Invalid Enrollment ID structure." });
+    }
+
+    const result = await database.collection("enrollments").deleteOne({
+      _id: new ObjectId(enrollmentId)
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Enrollment record not found." });
+    }
+
+    res.json({ success: true, message: "Successfully unenrolled from this workspace." });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error during unenrollment processing.", 
+      error: (error as any).message 
+    });
+  }
+});
+
+
+    app.patch("/api/user/update-profile", async (req, res) => {
+      try {
+        const { email, name, image } = req.body;
+
+        if (!email) {
+          return res.status(400).json({ success: false, message: "User email identity is required." });
+        }
+
+        if (!name.trim()) {
+          return res.status(400).json({ success: false, message: "Name parameter cannot be empty." });
+        }
+
+        // 💡 Better-Auth এর ডিফল্ট কালেকশন নেম 'users' এ ফিক্স করা হয়েছে (plural)
+        const result = await database.collection("user").updateOne(
+          { email: email.toString() },
+          { 
+            $set: { 
+              name: name,
+              image: image || "" 
+            } 
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ success: false, message: "User account identity not found in database cluster." });
+        }
+
+        res.json({ success: true, message: "Profile matrix updated successfully!" });
+      } catch (error) {
+        res.status(500).json({ 
+          success: false, 
+          message: "Internal server error during profile sync.", 
+          error: (error as any).message 
+        });
       }
     });
 
